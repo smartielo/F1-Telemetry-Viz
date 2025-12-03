@@ -93,7 +93,7 @@ class F1Window(arcade.Window):
         # Usamos busca binária (searchsorted) do Numpy que é MUITO rápida
         times = self.telemetry_data['TimeSeconds'].values
 
-        # Se o tempo passou do final da volta, reseta (loop)
+        # Se o tempo passou do final da volta, reset (loop)
         if self.time_elapsed > times[-1]:
             self.time_elapsed = 0
 
