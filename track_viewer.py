@@ -3,127 +3,203 @@ import fastf1
 import pandas as pd
 import numpy as np
 
-
-# Configurações da Janela
-SCREEN_WIDTH = 800
+# --- CONFIGURAÇÕES VISUAIS ---
+SCREEN_WIDTH = 1000  # Aumentei para caber o menu lateral
 SCREEN_HEIGHT = 600
-SCREEN_TITLE = "F1 Telemetry Viewer - Interlagos"
+SCREEN_TITLE = "F1 Telemetry: Brazil 2023 Analysis"
+BG_COLOR = arcade.color.BLACK
+TRACK_COLOR = arcade.color.WHITE_SMOKE
+UI_BG_COLOR = arcade.color.CHARCOAL
 
-# Cores
-BG_COLOR = arcade.color.BLACK #background color
-TRACK_COLOR = arcade.color.WHITE #track color
-CAR_COLOR = arcade.color.RED #car color
+# Cores das Equipes
+TEAM_COLORS = {
+    'Red Bull Racing': arcade.color.RED_DEVIL,
+    'McLaren': arcade.color.ORANGE_PEEL,
+    'Ferrari': arcade.color.YELLOW,
+    'Mercedes': arcade.color.CYAN,
+    'Aston Martin': arcade.color.BRITISH_RACING_GREEN,
+}
+
+
+class Car:
+    def __init__(self, driver_code, team_name, telemetry_data):
+        self.driver_code = driver_code
+        self.team_name = team_name
+        self.color = TEAM_COLORS.get(team_name, arcade.color.GRAY)
+
+        # Dados
+        self.telemetry = telemetry_data
+        if 'TimeSeconds' not in self.telemetry.columns:
+            self.telemetry['TimeSeconds'] = self.telemetry['Time'].dt.total_seconds()
+
+        self.times = self.telemetry['TimeSeconds'].values
+        self.x = -100
+        self.y = -100
+
+        # Para suavizar o movimento (lerp)
+        self.max_time = self.times[-1]
+
+    def update_position(self, current_time, map_scale, offsets, min_x, min_y):
+        # Loop infinito da volta
+        loop_time = current_time % self.max_time
+
+        # Busca binária
+        idx = np.searchsorted(self.times, loop_time)
+        if idx >= len(self.telemetry):
+            idx = len(self.telemetry) - 1
+
+        row = self.telemetry.iloc[idx]
+
+        # Conversão Mundo -> Tela
+        world_x = row['X']
+        world_y = row['Y']
+
+        target_x = (world_x - min_x) * map_scale + offsets[0]
+        target_y = (world_y - min_y) * map_scale + offsets[1]
+
+        # Atualização direta (sem interpolação complexa por enquanto)
+        self.x = target_x
+        self.y = target_y
+
+    def draw(self):
+        if self.x > 0:
+            arcade.draw_circle_filled(self.x, self.y, 8, self.color)
+            # Texto pequeno com nome
+            arcade.draw_text(self.driver_code, self.x + 10, self.y + 10, self.color, 9, bold=True)
+
 
 class F1Window(arcade.Window):
     def __init__(self):
         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_TITLE)
         arcade.set_background_color(BG_COLOR)
 
-        # Onde vamos guardar as coordenadas processadas
         self.track_points = []
-        self.map_scale = 1.0  # Inicializamos com um valor padrão
-        self.offsets = (0, 0)  # x_offset, y_offset
+        self.cars = []
 
-        # Variáveis de Animação
-        self.telemetry_data = None  # Vai guardar o DataFrame com os dados
-        self.time_elapsed = 0.0  # Relógio interno da nossa simulação (em segundos)
-        self.car_position = (0, 0)  # Posição X,Y atual do carro na tela
+        # Estado da Simulação
+        self.time_elapsed = 0.0
+        self.speed_multiplier = 1.0  # 1x velocidade normal
+        self.paused = False
+
+        # Variáveis de escala
+        self.map_scale = 1.0
+        self.offsets = (0, 0)
+        self.min_x = 0
+        self.min_y = 0
 
     def setup(self):
-        """ Aqui carregamos os dados e fazemos a matemática pesada """
-        print("Baixando dados...")
+        print("--- INICIANDO TELEMETRIA F1 ---")
         fastf1.Cache.enable_cache('cache')
         session = fastf1.get_session(2023, 'Brazil', 'R')
         session.load()
 
-        # Pegamos a volta mais rápida
-        lap = session.laps.pick_fastest()
-        self.telemetry_data = lap.get_telemetry()
-        self.telemetry_data['TimeSeconds'] = self.telemetry_data['Time'].dt.total_seconds()
+        # 1. Configurar Pista (Baseado no Verstappen)
+        print("Calculando geometria da pista...")
+        fastest_lap = session.laps.pick_fastest()
+        ref_tel = fastest_lap.get_telemetry()
 
-        # Dados brutos (Mundo)
-        x_series = self.telemetry_data['X'].values
-        y_series = self.telemetry_data['Y'].values
+        x_series = ref_tel['X'].values
+        y_series = ref_tel['Y'].values
 
-        # --- MATEMÁTICA DE ESCALA ---
-        # 1. Encontrar os limites do mapa
-        min_x, max_x = x_series.min(), x_series.max()
-        min_y, max_y = y_series.min(), y_series.max()
+        self.min_x, max_x = x_series.min(), x_series.max()
+        self.min_y, max_y = y_series.min(), y_series.max()
 
-        track_width_m = max_x - min_x
-        track_height_m = max_y - min_y
+        # Deixa espaço para o menu lateral (800px para pista, 200px para menu)
+        track_area_width = 800
 
-        # 2. Definir a escala (Renomeado para map_scale)
-        scale_x = (SCREEN_WIDTH - 100) / track_width_m
-        scale_y = (SCREEN_HEIGHT - 100) / track_height_m
+        track_width = max_x - self.min_x
+        track_height = max_y - self.min_y
 
+        scale_x = (track_area_width - 100) / track_width
+        scale_y = (SCREEN_HEIGHT - 100) / track_height
         self.map_scale = min(scale_x, scale_y)
 
-        # 3. Centralizar a pista
-        # Usamos self.map_scale aqui
-        x_center_offset = (SCREEN_WIDTH - (track_width_m * self.map_scale)) / 2
-        y_center_offset = (SCREEN_HEIGHT - (track_height_m * self.map_scale)) / 2
-        self.offsets = (x_center_offset, y_center_offset)  # Guardamos para usar na animação
+        ox = (track_area_width - track_width * self.map_scale) / 2
+        oy = (SCREEN_HEIGHT - track_height * self.map_scale) / 2
+        self.offsets = (ox, oy)
 
-        # 4. Transformar todos os pontos
-        print("Processando coordenadas...")
+        # Gera o desenho da pista
         self.track_points = []
         for x, y in zip(x_series, y_series):
-            sx, sy = self.world_to_screen(x, y, min_x, min_y)
+            sx = (x - self.min_x) * self.map_scale + ox
+            sy = (y - self.min_y) * self.map_scale + oy
             self.track_points.append((sx, sy))
-        self.min_x = min_x
-        self.min_y = min_y
 
-    def world_to_screen(self, x, y, min_x, min_y):
-        """ Função auxiliar para converter coordenadas """
-        sx = (x - min_x) * self.map_scale + self.offsets[0]
-        sy = (y - min_y) * self.map_scale + self.offsets[1]
-        return sx, sy
+        # 2. Carregar Pilotos (Top 5)
+        drivers = ['NOR', 'VER', 'ALO', 'STR', 'HAM']
+        print(f"Carregando pilotos: {drivers}")
+
+        for driver in drivers:
+            try:
+                d_lap = session.laps.pick_driver(driver).pick_fastest()
+                d_tel = d_lap.get_telemetry()
+                team = d_lap['Team']
+                self.cars.append(Car(driver, team, d_tel))
+            except:
+                print(f"Erro ao carregar {driver}")
 
     def on_update(self, delta_time):
-        """ Lógica do jogo: chamada a cada frame (aprox 1/60s) """
-        if self.telemetry_data is None:
+        if self.paused:
             return
 
-        # 1. Avança o relógio da simulação
-        # Multiplique por 2 ou 4 se quiser acelerar (ex: delta_time * 2)
-        self.time_elapsed += delta_time
+        # Aplica o multiplicador de velocidade
+        self.time_elapsed += delta_time * self.speed_multiplier
 
-        # 2. Encontra a linha de dados mais próxima do tempo atual
-        # Usamos busca binária (searchsorted) do Numpy que é MUITO rápida
-        times = self.telemetry_data['TimeSeconds'].values
-
-        # Se o tempo passou do final da volta, reset (loop)
-        if self.time_elapsed > times[-1]:
-            self.time_elapsed = 0
-
-        # Acha o índice do dado mais próximo
-        idx = np.searchsorted(times, self.time_elapsed)
-
-        # Evita erro de índice no final do array
-        if idx >= len(self.telemetry_data):
-            idx = len(self.telemetry_data) - 1
-
-        # 3. Pega as coordenadas X, Y daquele momento
-        row = self.telemetry_data.iloc[idx]
-        world_x = row['X']
-        world_y = row['Y']
-
-        # 4. Converte para tela e atualiza a posição do carro
-        self.car_position = self.world_to_screen(world_x, world_y, self.min_x, self.min_y)
+        for car in self.cars:
+            car.update_position(self.time_elapsed, self.map_scale, self.offsets, self.min_x, self.min_y)
 
     def on_draw(self):
         self.clear()
 
-        # Desenha a pista
+        # 1. Desenha a Pista
         if self.track_points:
-            arcade.draw_line_strip(self.track_points, TRACK_COLOR, 3)
+            arcade.draw_line_strip(self.track_points, TRACK_COLOR, 2)
 
-        # Desenha o carro (Círculo Vermelho)
-        cx, cy = self.car_position
-        # O carro só aparece se tivermos coordenadas válidas
-        if cx > 0 and cy > 0:
-            arcade.draw_circle_filled(cx, cy, 5, CAR_COLOR)  # Raio 5
+        # 2. Desenha os Carros
+        for car in self.cars:
+            car.draw()
+
+        # 3. Desenha a Interface (UI) - Menu Lateral
+        # Fundo do menu
+        arcade.draw_lrbt_rectangle_filled(800, SCREEN_WIDTH, 0, SCREEN_HEIGHT, UI_BG_COLOR)
+
+        # Título do Menu
+        arcade.draw_text("LEADERBOARD", 820, SCREEN_HEIGHT - 40, arcade.color.WHITE, 14, bold=True)
+
+        # Lista de Pilotos (Manual por enquanto)
+        y_pos = SCREEN_HEIGHT - 80
+        for car in self.cars:
+            # Nome e Equipe
+            arcade.draw_text(f"{car.driver_code}", 820, y_pos, arcade.color.WHITE, 12, bold=True)
+            arcade.draw_text(f"{car.team_name}", 860, y_pos, car.color, 10)
+            y_pos -= 30
+
+        # --- CONTROLES E STATUS ---
+        y_bottom = 100
+        arcade.draw_text(f"Tempo: {self.time_elapsed:.2f}s", 820, y_bottom, arcade.color.WHITE, 12)
+        arcade.draw_text(f"Velocidade: {self.speed_multiplier:.1f}x", 820, y_bottom - 20, arcade.color.GREEN, 12)
+
+        status = "PAUSADO" if self.paused else "RODANDO"
+        arcade.draw_text(f"Status: {status}", 820, y_bottom - 40,
+                         arcade.color.YELLOW if self.paused else arcade.color.GREEN, 12)
+
+        # Instruções
+        arcade.draw_text("[ESPAÇO] Pausar", 820, 40, arcade.color.GRAY, 10)
+        arcade.draw_text("[CIMA/BAIXO] Velocidade", 820, 20, arcade.color.GRAY, 10)
+
+    def on_key_press(self, key, modifiers):
+        """ Controle de Teclado """
+
+        if key == arcade.key.SPACE:
+            self.paused = not self.paused
+
+        elif key == arcade.key.UP:
+            self.speed_multiplier += 0.5
+
+        elif key == arcade.key.DOWN:
+            self.speed_multiplier -= 0.5
+            if self.speed_multiplier < 0.5: self.speed_multiplier = 0.5
+
 
 if __name__ == "__main__":
     app = F1Window()
